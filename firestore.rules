@@ -1,0 +1,101 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    
+    // Global Deny
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    // Helpers
+    function isSignedIn() {
+      return request.auth != null;
+    }
+    
+    function incoming() {
+      return request.resource.data;
+    }
+    
+    function existing() {
+      return resource.data;
+    }
+    
+    function isValidId(id) {
+      return id is string && id.size() > 0 && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$');
+    }
+
+    function isSystemAdmin() {
+      return isSignedIn() && exists(/databases/$(database)/documents/users/$(request.auth.uid)) && get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role == 'admin';
+    }
+
+    // Validations
+    function isValidUser(data) {
+      return data.keys().hasAll(['email', 'name', 'role', 'createdAt', 'updatedAt'])
+        && data.email is string && data.email.size() > 0 && data.email.size() <= 200
+        && data.name is string && data.name.size() > 0 && data.name.size() <= 100
+        && data.role is string && data.role in ['customer', 'admin', 'restaurant_owner', 'rider']
+        && (data.createdAt == request.time || data.createdAt is timestamp);
+    }
+
+    function isValidRestaurant(data) {
+      return data.keys().hasAll(['ownerId', 'name', 'isOpen', 'createdAt', 'updatedAt'])
+        && data.ownerId is string && data.ownerId.size() > 0
+        && data.name is string && data.name.size() > 0 && data.name.size() <= 100
+        && data.isOpen is bool
+        && (data.createdAt == request.time || data.createdAt is timestamp);
+    }
+    
+    function isValidMenuItem(data) {
+      return data.keys().hasAll(['restaurantId', 'name', 'price', 'isVeg', 'isAvailable', 'createdAt', 'updatedAt'])
+        && data.restaurantId is string && data.restaurantId.size() > 0
+        && data.name is string && data.name.size() > 0 && data.name.size() <= 100
+        && data.price is number && data.price >= 0
+        && data.isVeg is bool
+        && data.isAvailable is bool
+        && (data.createdAt == request.time || data.createdAt is timestamp);
+    }
+
+    function isValidOrder(data) {
+      return data.keys().hasAll(['customerId', 'restaurantId', 'items', 'totalAmount', 'status', 'deliveryAddress', 'createdAt', 'updatedAt'])
+        && data.customerId is string && data.customerId.size() > 0
+        && data.restaurantId is string && data.restaurantId.size() > 0
+        && data.items is list
+        && data.totalAmount is number && data.totalAmount >= 0
+        && data.status is string && data.status in ['pending', 'accepted', 'preparing', 'ready', 'picked_up', 'delivered', 'cancelled']
+        && data.deliveryAddress is string && data.deliveryAddress.size() > 0 && data.deliveryAddress.size() <= 300
+        && (data.createdAt == request.time || data.createdAt is timestamp);
+    }
+
+    // Collections
+    match /users/{userId} {
+      allow read: if isSignedIn();
+      allow create: if isSignedIn() && request.auth.uid == userId && isValidUser(incoming());
+      allow update: if isSignedIn() && request.auth.uid == userId && isValidUser(incoming()) && incoming().role == existing().role;
+    }
+
+    match /restaurants/{restaurantId} {
+      allow read: if true; // Public read for listings
+      allow create: if isSignedIn() && isValidRestaurant(incoming()) && incoming().ownerId == request.auth.uid;
+      allow update: if isSignedIn() && isValidRestaurant(incoming()) && (existing().ownerId == request.auth.uid || isSystemAdmin());
+    }
+
+    match /menuItems/{menuItemId} {
+      allow read: if true; // Public read
+      allow create: if isSignedIn() && isValidMenuItem(incoming()) && exists(/databases/$(database)/documents/restaurants/$(incoming().restaurantId)) && get(/databases/$(database)/documents/restaurants/$(incoming().restaurantId)).data.ownerId == request.auth.uid;
+      allow update: if isSignedIn() && isValidMenuItem(incoming()) && exists(/databases/$(database)/documents/restaurants/$(existing().restaurantId)) && get(/databases/$(database)/documents/restaurants/$(existing().restaurantId)).data.ownerId == request.auth.uid;
+    }
+
+    match /orders/{orderId} {
+      allow read: if isSignedIn() && (existing().customerId == request.auth.uid || isSystemAdmin() || (existing().riderId != null && existing().riderId == request.auth.uid) || (exists(/databases/$(database)/documents/restaurants/$(existing().restaurantId)) && get(/databases/$(database)/documents/restaurants/$(existing().restaurantId)).data.ownerId == request.auth.uid));
+      allow create: if isSignedIn() && isValidOrder(incoming()) && incoming().customerId == request.auth.uid;
+      allow update: if isSignedIn() && isValidOrder(incoming()) && (
+        // Customer can cancel
+        (existing().customerId == request.auth.uid && incoming().diff(existing()).affectedKeys().hasOnly(['status', 'updatedAt']) && incoming().status == 'cancelled') ||
+        // Admin or owner or rider can update status
+        isSystemAdmin() ||
+        (exists(/databases/$(database)/documents/restaurants/$(existing().restaurantId)) && get(/databases/$(database)/documents/restaurants/$(existing().restaurantId)).data.ownerId == request.auth.uid) ||
+        (existing().riderId != null && existing().riderId == request.auth.uid)
+      );
+    }
+  }
+}
